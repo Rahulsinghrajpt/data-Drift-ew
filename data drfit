@@ -1,0 +1,419 @@
+def detect_channel_activation_deactivation(
+    retailer_df: Any,
+    profile: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Detect Channel Activation/Deactivation (ME-5806a).
+    Trigger when:
+    - active history < threshold AND latest spend > 0 (activation)
+    - active history >= threshold AND latest spend == 0 (deactivation)
+    """
+    if retailer_df is None or len(retailer_df) == 0:
+        return {
+            'detected': False,
+            'severity': 'NONE',
+            'anomalies': [],
+            'drift_metric_current': 0.0
+        }
+
+    spend_stats = profile.get('spend_stats', {}) if profile else {}
+    thresholds = profile.get('thresholds', {}) if profile else {}
+
+    min_active_weeks = int(_to_float(thresholds.get('MIN_ACTIVE_WEEKS_FOR_STABILITY')) or MIN_ACTIVE_WEEKS_DEFAULT)
+
+    latest_row = retailer_df.iloc[-1]
+    anomalies = []
+
+    for channel_name, stats in spend_stats.items():
+        if channel_name not in retailer_df.columns:
+            continue
+
+        current_value = _to_float(latest_row.get(channel_name))
+
+        active_weeks = int(_to_float(stats.get('active_weeks', stats.get('count', 0))))
+
+        if current_value is not None and current_value > 1e-9:
+            if active_weeks < min_active_weeks:
+                anomalies.append({
+                    'channel': channel_name,
+                    'type': 'ACTIVATION',
+                    'current_value': round(current_value, 4),
+                    'active_weeks': active_weeks,
+                    'threshold': min_active_weeks,
+                    'severity': 'RED'
+                })
+        elif current_value is not None and current_value <= 1e-9:
+            if active_weeks >= min_active_weeks:
+                anomalies.append({
+                    'channel': channel_name,
+                    'type': 'DEACTIVATION',
+                    'current_value': 0.0,
+                    'active_weeks': active_weeks,
+                    'threshold': min_active_weeks,
+                    'severity': 'RED'
+                })
+
+    detected = len(anomalies) > 0
+    return {
+        'detected': detected,
+        'severity': 'RED' if detected else 'NONE',
+        'anomalies': anomalies,
+        'drift_metric_current': float(len(anomalies))
+    }
+
+
+def send_channel_activation_deactivation_alert(
+    client_id: str,
+    brand_name: str,
+    retailer_id: str,
+    filename: str,
+    detection_result: Dict[str, Any],
+    status_logger: Optional[Any] = None,
+) -> bool:
+    """Send async Slack alert for Channel Activation/Deactivation (ME-5806a)."""
+    if not detection_result or not detection_result.get('detected'):
+        return True
+    try:
+        payload = {
+            'alert_type': 'CHANNEL_ACTIVATION_DEACTIVATION',
+            'client_id': client_id,
+            'brand_name': brand_name,
+            'retailer_id': retailer_id,
+            'filename': filename,
+            'severity': detection_result.get('severity', 'RED'),
+            'drift_metric_current': detection_result.get('drift_metric_current', 0.0),
+            'anomalies': detection_result.get('anomalies', []),
+            'message': 'Channel activation/deactivation detected. Full retrain required.'
+        }
+        response = lambda_client.invoke(
+            FunctionName=SLACK_LAMBDA_NAME,
+            InvocationType='Event',
+            Payload=json.dumps(payload)
+        )
+        if response.get('StatusCode') == 202:
+            _transfer_info(
+                status_logger,
+                f"Channel activation/deactivation alert sent for {client_id}/{brand_name}/{retailer_id}",
+                alert_type="CHANNEL_ACTIVATION_DEACTIVATION",
+            )
+            return True
+        _transfer_warning(
+            status_logger,
+            f"Channel activation/deactivation alert may have failed: StatusCode={response.get('StatusCode')}",
+            alert_type="CHANNEL_ACTIVATION_DEACTIVATION",
+        )
+        return False
+    except Exception as e:
+        _transfer_warning(
+            status_logger,
+            f"Failed to send channel activation/deactivation alert: {e}",
+            alert_type="CHANNEL_ACTIVATION_DEACTIVATION",
+        )
+        return False
+
+
+def handle_channel_activation_deactivation_actions(
+    client_id: str,
+    brand_name: str,
+    retailer_id: str,
+    filename: str,
+    detection_result: Dict[str, Any],
+    status_logger: Optional[Any] = None,
+) -> None:
+    """Execute ME-5806a actions: Slack alert + retraining_required flip + drift metric update."""
+    if not detection_result or not detection_result.get('detected'):
+        return
+    send_channel_activation_deactivation_alert(
+        client_id=client_id,
+        brand_name=brand_name,
+        retailer_id=retailer_id,
+        filename=filename,
+        detection_result=detection_result,
+        status_logger=status_logger,
+    )
+    if not PipelineInfoHelper:
+        _transfer_warning(
+            status_logger,
+            "PipelineInfoHelper unavailable - cannot persist channel activation/deactivation metrics",
+            alert_type="CHANNEL_ACTIVATION_DEACTIVATION",
+        )
+        return
+    try:
+        helper = PipelineInfoHelper(ENVIRONMENT, status_logger=status_logger)
+        drift_metric_current = _to_float(detection_result.get('drift_metric_current')) or 0.0
+        helper.update_drift_metrics(
+            client_id=client_id,
+            brand_name=brand_name,
+            retailer_id=retailer_id,
+            drift_metric_current=drift_metric_current,
+            retraining_required=True
+        )
+        _transfer_info(
+            status_logger,
+            f"ME-5806a persisted drift metrics for {client_id}/{brand_name}/{retailer_id}: "
+            f"drift_metric_current={drift_metric_current}",
+            alert_type="CHANNEL_ACTIVATION_DEACTIVATION",
+        )
+    except Exception as e:
+        _transfer_warning(
+            status_logger,
+            f"Failed to persist channel activation/deactivation metrics: {e}",
+            alert_type="CHANNEL_ACTIVATION_DEACTIVATION",
+        )
+
+
+def _jensen_shannon_divergence(p: List[float], q: List[float], eps: float = 1e-12) -> float:
+    """Compute Jensen-Shannon divergence between two distributions."""
+    try:
+        import numpy as np
+    except ImportError:
+        return 0.0
+
+    p_arr = np.asarray(p, dtype=float)
+    q_arr = np.asarray(q, dtype=float)
+
+    p_sum, q_sum = p_arr.sum(), q_arr.sum()
+    if p_sum <= 0 or q_sum <= 0:
+        return 0.0
+
+    p_arr = p_arr / p_sum
+    q_arr = q_arr / q_sum
+    m = 0.5 * (p_arr + q_arr)
+
+    kl_p = np.sum(p_arr * np.log((p_arr + eps) / (m + eps)))
+    kl_q = np.sum(q_arr * np.log((q_arr + eps) / (m + eps)))
+
+    return float(0.5 * kl_p + 0.5 * kl_q)
+
+
+def detect_spend_mix_reallocation(
+    retailer_df: Any,
+    profile: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Detect Spend Mix Reallocation (ME-5806b).
+    Trigger when JS divergence or max absolute share delta exceed thresholds.
+    """
+    if retailer_df is None or len(retailer_df) == 0:
+        return {
+            'detected': False,
+            'severity': 'NONE',
+            'anomalies': [],
+            'drift_metric_current': 0.0
+        }
+
+    mix_profile = profile.get('mix_profile', {}) if profile else {}
+    spend_cols_mix = mix_profile.get('spend_cols', [])
+    avg_share_raw = mix_profile.get('avg_share', [])
+
+    avg_share_map: Dict[str, float] = {}
+    if isinstance(avg_share_raw, dict):
+        for k, v in avg_share_raw.items():
+            avg_share_map[str(k)] = _to_float(v) or 0.0
+        spend_cols = list(spend_cols_mix) if spend_cols_mix else sorted(avg_share_map.keys())
+    elif isinstance(avg_share_raw, list) and spend_cols_mix:
+        for i, ch in enumerate(spend_cols_mix):
+            val = _to_float(avg_share_raw[i]) if i < len(avg_share_raw) else 0.0
+            avg_share_map[ch] = val or 0.0
+        spend_cols = list(spend_cols_mix)
+    else:
+        return {
+            'detected': False,
+            'severity': 'NONE',
+            'anomalies': [],
+            'drift_metric_current': 0.0
+        }
+
+    if not spend_cols or not avg_share_map:
+        return {
+            'detected': False,
+            'severity': 'NONE',
+            'anomalies': [],
+            'drift_metric_current': 0.0
+        }
+
+    thresholds = profile.get('thresholds', {}) if profile else {}
+    mix_shift_yellow = _to_float(thresholds.get('MIX_SHIFT_YELLOW')) or MIX_SHIFT_YELLOW_DEFAULT
+    mix_shift_red = _to_float(thresholds.get('MIX_SHIFT_RED')) or MIX_SHIFT_RED_DEFAULT
+    js_yellow = _to_float(thresholds.get('JS_YELLOW')) or JS_YELLOW_DEFAULT
+    js_red = _to_float(thresholds.get('JS_RED')) or JS_RED_DEFAULT
+
+    latest_row = retailer_df.iloc[-1]
+
+    current_spend_vec = []
+    baseline_share_vec = []
+    total_spend = 0.0
+
+    for channel in spend_cols:
+        if channel in retailer_df.columns:
+            spend_val = _to_float(latest_row.get(channel)) or 0.0
+        else:
+            spend_val = 0.0
+        current_spend_vec.append(spend_val)
+        total_spend += spend_val
+        baseline_share_vec.append(avg_share_map.get(channel, 0.0))
+
+    if total_spend <= 1e-9:
+        return {
+            'detected': False,
+            'severity': 'NONE',
+            'anomalies': [],
+            'drift_metric_current': 0.0
+        }
+
+    current_share_vec = [v / total_spend for v in current_spend_vec]
+    js_div = _jensen_shannon_divergence(current_share_vec, baseline_share_vec)
+
+    max_delta = 0.0
+    channel_deltas = []
+
+    for idx, channel in enumerate(spend_cols):
+        c_share = current_share_vec[idx]
+        b_share = baseline_share_vec[idx]
+        delta = abs(c_share - b_share)
+        max_delta = max(max_delta, delta)
+        channel_deltas.append({
+            'channel': channel,
+            'current_share': round(c_share, 4),
+            'baseline_share': round(b_share, 4),
+            'delta': round(delta, 4)
+        })
+
+    yellow_trigger = max_delta >= mix_shift_yellow or js_div >= js_yellow
+    red_trigger = max_delta >= mix_shift_red or js_div >= js_red
+
+    if not (yellow_trigger or red_trigger):
+        return {
+            'detected': False,
+            'severity': 'NONE',
+            'anomalies': [],
+            'drift_metric_current': 0.0
+        }
+
+    severity = 'RED' if red_trigger else 'YELLOW'
+
+    anomalies = [{
+        'total_spend': round(total_spend, 4),
+        'max_share_delta': round(max_delta, 4),
+        'js_divergence': round(js_div, 4),
+        'channel_deltas': channel_deltas,
+        'threshold_breaches': {
+            'max_delta_yellow': max_delta >= mix_shift_yellow,
+            'max_delta_red': max_delta >= mix_shift_red,
+            'js_yellow': js_div >= js_yellow,
+            'js_red': js_div >= js_red,
+        },
+        'severity': severity
+    }]
+
+    normalized_js = js_div / js_yellow if js_yellow > 0 else 0
+    normalized_delta = max_delta / mix_shift_yellow if mix_shift_yellow > 0 else 0
+    drift_metric_current = float(max(normalized_js, normalized_delta))
+
+    return {
+        'detected': True,
+        'severity': severity,
+        'anomalies': anomalies,
+        'drift_metric_current': round(drift_metric_current, 6)
+    }
+
+
+def send_spend_mix_reallocation_alert(
+    client_id: str,
+    brand_name: str,
+    retailer_id: str,
+    filename: str,
+    detection_result: Dict[str, Any],
+    status_logger: Optional[Any] = None,
+) -> bool:
+    """Send async Slack alert for Spend Mix Reallocation (ME-5806b)."""
+    if not detection_result or not detection_result.get('detected'):
+        return True
+    try:
+        payload = {
+            'alert_type': 'SPEND_MIX_REALLOCATION',
+            'client_id': client_id,
+            'brand_name': brand_name,
+            'retailer_id': retailer_id,
+            'filename': filename,
+            'severity': detection_result.get('severity', 'YELLOW'),
+            'drift_metric_current': detection_result.get('drift_metric_current', 0.0),
+            'anomalies': detection_result.get('anomalies', []),
+            'message': 'Spend mix reallocation detected. Full retrain required.'
+        }
+        response = lambda_client.invoke(
+            FunctionName=SLACK_LAMBDA_NAME,
+            InvocationType='Event',
+            Payload=json.dumps(payload)
+        )
+        if response.get('StatusCode') == 202:
+            _transfer_info(
+                status_logger,
+                f"Spend mix reallocation alert sent for {client_id}/{brand_name}/{retailer_id}",
+                alert_type="SPEND_MIX_REALLOCATION",
+            )
+            return True
+        _transfer_warning(
+            status_logger,
+            f"Spend mix reallocation alert may have failed: StatusCode={response.get('StatusCode')}",
+            alert_type="SPEND_MIX_REALLOCATION",
+        )
+        return False
+    except Exception as e:
+        _transfer_warning(
+            status_logger,
+            f"Failed to send spend mix reallocation alert: {e}",
+            alert_type="SPEND_MIX_REALLOCATION",
+        )
+        return False
+
+
+def handle_spend_mix_reallocation_actions(
+    client_id: str,
+    brand_name: str,
+    retailer_id: str,
+    filename: str,
+    detection_result: Dict[str, Any],
+    status_logger: Optional[Any] = None,
+) -> None:
+    """Execute ME-5806b actions: Slack alert + retraining_required flip + drift metric update."""
+    if not detection_result or not detection_result.get('detected'):
+        return
+    send_spend_mix_reallocation_alert(
+        client_id=client_id,
+        brand_name=brand_name,
+        retailer_id=retailer_id,
+        filename=filename,
+        detection_result=detection_result,
+        status_logger=status_logger,
+    )
+    if not PipelineInfoHelper:
+        _transfer_warning(
+            status_logger,
+            "PipelineInfoHelper unavailable - cannot persist spend mix reallocation metrics",
+            alert_type="SPEND_MIX_REALLOCATION",
+        )
+        return
+    try:
+        helper = PipelineInfoHelper(ENVIRONMENT, status_logger=status_logger)
+        drift_metric_current = _to_float(detection_result.get('drift_metric_current')) or 0.0
+        helper.update_drift_metrics(
+            client_id=client_id,
+            brand_name=brand_name,
+            retailer_id=retailer_id,
+            drift_metric_current=drift_metric_current,
+            retraining_required=True
+        )
+        _transfer_info(
+            status_logger,
+            f"ME-5806b persisted drift metrics for {client_id}/{brand_name}/{retailer_id}: "
+            f"drift_metric_current={drift_metric_current}",
+            alert_type="SPEND_MIX_REALLOCATION",
+        )
+    except Exception as e:
+        _transfer_warning(
+            status_logger,
+            f"Failed to persist spend mix reallocation metrics: {e}",
+            alert_type="SPEND_MIX_REALLOCATION",
+        )
+
