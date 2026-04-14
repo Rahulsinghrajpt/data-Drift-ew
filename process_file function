@@ -1,0 +1,223 @@
+process_file -- Full Logic Walkthrough
+This function handles one CSV file for a specific client/brand/retailer. It is called once per file inside the main file-processing loop. It returns (success: bool, dest_key: str, total_records: int).
+
+flowchart TD
+    A["Start: process_file(file_key, client_id, brand_name, retailer_id, ...)"] --> B[Download from Tracer S3]
+    B --> C{Empty file?}
+    C -->|Yes| Z1["return False, empty, 0"]
+    C -->|No| D{Is .csv?}
+    D -->|No| Z1
+    D -->|Yes| E[validate_file_content]
+    E --> F{Valid?}
+    F -->|No| Z1
+    F -->|Yes| G[get_available_retailers from DynamoDB]
+    G --> H[transform_data - standardize columns/dates]
+    H --> I{Pandas available?}
+    I -->|No| Z1
+    I -->|Yes| J[process_with_pandas - split by retailer]
+    J --> K{Retailer files created?}
+    K -->|No| Z1
+    K -->|Yes| L{Event retailer in output?}
+    L -->|No| Z1
+    L -->|Yes| M[upload_to_client_bucket - VIP S3]
+    M --> N[Count rows with pandas]
+    N --> O[Run drift detectors ME-5401/5402/5806a/5806b]
+    O --> P["return True, dest_key, total_records"]
+
+
+Phase 1: Download (line 4404)
+
+lambda_function.py
+Lines 4404-4404
+        raw_data = download_from_tracer(file_key, status_logger=status_logger)
+Downloads the raw CSV bytes from the Tracer S3 bucket (prd-mm-vendor-sync). This is the source bucket where vendor data lands.
+
+Phase 2: Basic Validation (lines 4406-4437)
+Three quick checks, each returning (False, "", 0) if failed:
+
+Empty file check (line 4410) -- Rejects 0-byte files. A file with even 1 byte passes this gate.
+
+Extension check (line 4418) -- Rejects anything that doesn't end in .csv.
+
+Content validation (line 4427) -- Calls validate_file_content() which checks that the CSV has proper headers, rows, and structural integrity. Returns a list of validation errors if something is wrong.
+
+Phase 3: Retailer Discovery (lines 4439-4452)
+
+lambda_function.py
+Lines 4441-4443
+        available_retailers = get_available_retailers(
+            client_id, brand_name, status_logger=status_logger
+        )
+Queries the pipeline-infos DynamoDB table to get all retailers registered for this client+brand. This is the "source of truth" for which retailers exist.
+
+If no retailers are found in DynamoDB, it falls back to a single-entry list using the retailer_id from the incoming event. It also ensures the event's retailer is in the list even if DynamoDB didn't return it.
+
+Phase 4: Data Transformation (lines 4454-4478)
+
+lambda_function.py
+Lines 4455-4457
+        transformed_data, transform_metadata = transform_data(
+            raw_data, file_key, retailer_id, status_logger=status_logger
+        )
+Standardizes the raw CSV:
+
+Renames "week" columns (like Week (From Mon)) to Date
+Reformats dates to YYYY-MM-DD
+Handles vendor-specific column naming differences
+Returns the transformed bytes and metadata about what happened (skipped, errors, success).
+
+Phase 5: Pandas Processing + Retailer Splitting (lines 4480-4508)
+
+lambda_function.py
+Lines 4492-4500
+        retailer_files = process_with_pandas(
+            transformed_data,
+            client_id,
+            brand_name,
+            available_retailers,
+            event_retailer_id=retailer_id,
+            filename=file_key,
+            status_logger=status_logger,
+        )
+This is the core processing step. process_with_pandas:
+
+Parses the CSV into a DataFrame
+Splits data by retailer (a single CSV can contain data for multiple retailers)
+Applies date transformations
+Reorders columns to the standard schema
+Returns a dict {retailer_id_lower: csv_bytes}.
+
+Phase 6: Fan-Out Safety Belt (lines 4510-4538)
+This is a critical safety mechanism (called "TASK 3"):
+
+
+lambda_function.py
+Lines 4526-4538
+        if event_retailer_id_lower not in retailer_files:
+            _transfer_error(
+                status_logger,
+                f"TASK 3 ERROR: Event retailer '{retailer_id}' not found in processed output. "
+                f"Available retailers: {detected_retailers}. Cannot upload.",
+                reason="event_retailer_missing",
+                file_key=file_key,
+                retailer_id=retailer_id,
+                detected_retailers=detected_retailers,
+            )
+            return False, "", 0
+        
+        retailer_data = retailer_files[event_retailer_id_lower]
+Even though process_with_pandas might detect multiple retailers in the CSV, the function only uploads data for the retailer specified in the event. This prevents "fan-out" -- where one Lambda invocation accidentally overwrites data for other retailers that have their own dedicated invocations. If the event retailer isn't in the output, it fails.
+
+Phase 7: Upload to VIP Bucket (lines 4541-4548)
+
+lambda_function.py
+Lines 4541-4548
+        dest_key = upload_to_client_bucket(
+            retailer_data,
+            file_key,
+            client_id,
+            brand_name,
+            retailer_id,
+            status_logger=status_logger,
+        )
+Uploads the processed CSV to the client's VIP S3 bucket at the path: preprocessed/{brand}/{retailer}/{retailer}.csv
+
+This is the bucket that downstream services (model training, predictions) read from.
+
+Phase 8: Row Counting (lines 4550-4555)
+
+lambda_function.py
+Lines 4551-4555
+        try:
+            df = pd.read_csv(io.BytesIO(retailer_data))
+            total_records = len(df)
+        except Exception:
+            total_records = max(1, len(retailer_data) // 100)
+Counts how many rows are in the uploaded data. If pandas fails for some reason, it estimates using byte size (roughly 100 bytes per row). This count goes into the audit log and metrics.
+
+Phase 9: Drift Detection (lines 4557-4804)
+This is the largest phase. It runs all four drift detectors against the retailer's data. The entire block is wrapped in try/except so that a drift failure never crashes the pipeline (it just logs a warning).
+
+Step 9a -- Eligibility Check (line 4565)
+
+
+lambda_function.py
+Lines 4565-4575
+                historical_df, latest_df, is_eligible = prepare_drift_data(df)
+                if not is_eligible:
+                    _transfer_info(
+                        status_logger,
+                        f"Drift checks skipped for {client_id}/{brand_name}/{retailer_id}: "
+                        f"insufficient history ({len(historical_df)} rows, need {MIN_ROWS_FOR_DRIFT})",
+                        client_id=client_id,
+                        brand_name=brand_name,
+                        retailer_id=retailer_id,
+                    )
+Splits the DataFrame into historical rows and the latest row. If there aren't enough historical rows (needs MIN_ROWS_FOR_DRIFT), drift checks are skipped entirely.
+
+Step 9b -- Schema Inference (line 4578)
+
+
+lambda_function.py
+Lines 4578-4578
+                    schema = infer_schema(df)
+Dynamically identifies which column is the KPI (e.g., Sales) and which columns are spend channels (e.g., amazon_spend, google_spend). If no KPI or no spend columns are found, drift checks are skipped.
+
+Step 9c -- Profile Building (line 4598)
+
+
+lambda_function.py
+Lines 4598-4598
+                        drift_profile = build_reference_profile(historical_df, schema)
+Builds a statistical baseline from the historical data: means, standard deviations, and proportional spend shares for each channel. This replaces the old static profile.json file -- every retailer now gets its own profile at runtime.
+
+Step 9d -- Four Detectors (lines 4600-4797)
+
+Each detector follows the same pattern:
+
+Call the detector function with (df, drift_profile)
+Extract the drift metric value
+Emit a Datadog gauge metric (the raw drift score, always)
+If detected == True: emit a counter metric, log a warning, and call handle_*_actions (which sends Slack alert + flips retraining_required in DynamoDB)
+The four detectors:
+
+Detector	What it checks	Metric name
+ME-5401 detect_spend_regime_shift	Z-scores of spend channels exceeding thresholds	data_ingestion.drift.spend_max_z
+ME-5402 detect_kpi_behavior_break	Residual Z-score of KPI after regressing on spend	data_ingestion.drift.kpi_residual_z
+ME-5806a detect_channel_activation_deactivation	Channels going from zero->nonzero or nonzero->zero	data_ingestion.drift.channel_activation_count
+ME-5806b detect_spend_mix_reallocation	Jensen-Shannon divergence of spend proportions	data_ingestion.drift.spend_mix_normalized
+Step 9e -- Overall Result (lines 4780-4797)
+
+After all four detectors run, it determines a single drift_checked_result label prioritized as: spend_shift > kpi_break > channel_activation > spend_mix > clean, and emits a final counter metric with that label.
+
+Phase 10: Return (line 4822)
+
+lambda_function.py
+Lines 4822-4822
+        return True, dest_key, total_records
+Returns success, the destination S3 key, and row count. The caller in lambda_handler uses this to update files_processed, records_processed, and populate the audit log + DynamoDB transfer log.
+
+Error Handling (lines 4823-4832)
+The entire function body is wrapped in a top-level try/except. If anything unhandled happens, it logs the exception and returns (False, "", 0) so the pipeline continues processing the next file rather than crashing.
+
+flowchart LR
+    subgraph input [Input]
+        TracerS3["Tracer S3 bucket"]
+    end
+    subgraph processFile [process_file]
+        Download --> Validate --> Transform --> SplitByRetailer --> SafetyBelt --> Upload
+        Upload --> CountRows --> DriftDetection
+    end
+    subgraph output [Outputs]
+        VIP["VIP S3 bucket"]
+        DD["Datadog metrics"]
+        Slack["Slack alerts"]
+        DDB["DynamoDB drift flags"]
+    end
+    TracerS3 --> Download
+    Upload --> VIP
+    DriftDetection --> DD
+    DriftDetection --> Slack
+    DriftDetection --> DDB
+
+In essence, process_file takes a raw vendor CSV from S3, validates it, transforms it to standard format, ensures only the correct retailer's data is processed, uploads it to the client's VIP bucket, and then runs health checks (drift detection) on the data quality -- all while logging everything to Datadog and Slack.
