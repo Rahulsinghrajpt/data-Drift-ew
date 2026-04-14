@@ -1,0 +1,33 @@
+We are not triggering the pipeline manually for any specific retailer. The pipeline runs via Step Functions, which checks active clients from DynamoDB and processes their files automatically.
+
+To trigger pipeline:
+
+Dev:
+
+$sfnArn = "arn:aws:states:eu-west-1:931493483974:stateMachine:mmm_dev_data_ingestion_orchestrator"
+aws stepfunctions start-execution --state-machine-arn $sfnArn --input '{}'
+
+QA:
+
+$sfnArn = "arn:aws:states:eu-west-1:931493483974:stateMachine:mmm_qa_data_ingestion_orchestrator"
+aws stepfunctions start-execution --state-machine-arn $sfnArn --input '{}'
+
+PRD:
+
+$sfnArn = "arn:aws:states:eu-west-1:931493483974:stateMachine:mmm_prd_data_ingestion_orchestrator"
+aws stepfunctions start-execution --state-machine-arn $sfnArn --input '{}'
+
+For specific retailer:
+Invoke Lambda mmm_dev_data_transfer with:
+
+{
+  "client_id": "auraqa1",
+  "brand_name": "auraqa1",
+  "retailer_id": "target",
+  "execution_id": "manual-test-001"
+}
+
+Logs:
+Available in S3:
+
+s3://mmm-dev-audit-logs/data-transfer/{YYYY}/{MM}/{DD}/{client_id}/{brand_name}/{retailer_id}/{execut
