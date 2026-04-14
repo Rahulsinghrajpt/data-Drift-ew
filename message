@@ -1,1 +1,3 @@
-(1:02) We decided Anish will be locking the dependency within that requirement.txt file. (1:09) So that it won't go beyond whatever specified by Anish.
+We are not triggering the pipeline manually for any specific retailer. The pipeline is triggered through Step Functions, which checks the active clients from DynamoDB. For all the active clients, their files are automatically picked up and processed by the pipeline.
+
+Also, we can view all the logs in the mmm-dev-audit-log S3 bucket. The path for the S3 bucket is mentioned below
