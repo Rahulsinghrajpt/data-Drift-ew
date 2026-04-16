@@ -22,8 +22,11 @@
     "message_display": "inline",
     "title": "All error logs (data ingestion)",
     "title_size": "16"
+  },
+  "layout": {
+    "x": 0,
+    "y": 8,
+    "width": 12,
+    "height": 6
   }
 }
-
-
-
