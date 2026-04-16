@@ -1,0 +1,29 @@
+{
+  "definition": {
+    "type": "log_stream",
+    "indexes": [],
+    "query": "service:data-ingestion-pipeline (status:error OR level:ERROR) $env",
+    "sort": {
+      "column": "time",
+      "order": "desc"
+    },
+    "columns": [
+      "host",
+      "service",
+      "@client_name",
+      "@brand_name",
+      "@retailer_name",
+      "@reason",
+      "@filename",
+      "message"
+    ],
+    "show_date_column": true,
+    "show_message_column": true,
+    "message_display": "inline",
+    "title": "All error logs (data ingestion)",
+    "title_size": "16"
+  }
+}
+
+
+
