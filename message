@@ -1,8 +1,11 @@
-13:
-Started working on onboarding pipeline observability and reviewed assigned tickets.
-14.Completed data drift ticket and got review confirmation from Seema for both data drift tasks.
-15:
-Configured Slack webhook in AWS Secrets Manager and validated in QA; worked on onboarding pipeline observability and prepared data ingestion documentation.
+We have implemented unit test cases inside the lambda/data-ingestion-pipeline/tests directory specifically for Aura QA1.
 
-16:
-Completed onboarding pipeline observability and dashboard; started Aura QA1 unit test integration.
+The objective of this setup is:
+
+Whenever a new Aura QA1 file  is received in the tracer (prd-mmm-vendor-sync),
+The pipeline should automatically pick up that file,
+Execute the corresponding unit test cases against it,
+Validate the data ingestion process.
+
+This entire workflow will be fully automated through the CI/CD pipeline.
+As part of CI execution, the tests will run automatically to ensure that any newly ingested Aura QA1 data meets the expected validation and quality checks.
